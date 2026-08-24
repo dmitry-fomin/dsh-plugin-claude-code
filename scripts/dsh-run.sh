@@ -54,7 +54,7 @@ usage() {
   cat >&2 <<'USAGE'
 usage:
   dsh-run.sh check [--json]
-  dsh-run.sh run [--write] [--model pro|flash|<имя>] [--effort <level>]
+  dsh-run.sh run [--write] [--model pro|flash|vision|<имя>] [--effort <level>]
                  [--cwd <dir>] [--timeout <сек>] [--background] < prompt.txt
   dsh-run.sh status [job-id]
   dsh-run.sh result <job-id>
@@ -291,6 +291,7 @@ run_background() {
   job_id="$(new_job_id)"
   job_dir="$JOBS_DIR/$job_id"
   mkdir -p "$job_dir"
+  chmod 700 "$STATE_DIR" "$JOBS_DIR" 2>/dev/null || true
   chmod 700 "$job_dir"
 
   printf '%s' "$prompt" > "$job_dir/prompt.txt"
@@ -427,6 +428,8 @@ cmd_transcript() {
 # --- диспетчер --------------------------------------------------------------
 [[ $# -eq 0 ]] && usage
 sub="$1"; shift
+# -h принимает любая подкоманда: субагент спрашивает синтаксис именно так.
+for a in "$@"; do [[ "$a" == "-h" || "$a" == "--help" ]] && usage; done
 case "$sub" in
   check)      cmd_check "$@" ;;
   run)        cmd_run "$@" ;;
