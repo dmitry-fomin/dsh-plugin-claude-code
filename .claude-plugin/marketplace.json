@@ -10,7 +10,7 @@
       "name": "dsh",
       "source": "./",
       "description": "Delegate tasks to DeepSeek Harness (dsh) from Claude Code: it explores the codebase itself, read-only by default.",
-      "version": "0.1.0",
+      "version": "0.1.1",
       "license": "MIT",
       "author": {
         "name": "Dmitry Fomin"
