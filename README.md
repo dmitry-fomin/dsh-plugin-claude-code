@@ -21,7 +21,7 @@ given repository *before* you delegate, and scope every task to the files it act
 ## Requirements
 
 - [Claude Code](https://code.claude.com) v2.1.216 or later — earlier versions drop the
-  plugin prefix from command names, so `/dsh:delegate` would not resolve
+  plugin prefix from command names, so `/dsh:dsh-delegate` would not resolve
 - DeepSeek Harness on your `PATH`, signed in, with the `headless` profile available:
   ```
   npm install -g @deepseek-ai/dsh
@@ -32,7 +32,7 @@ given repository *before* you delegate, and scope every task to the files it act
   its flags may still move.
 - `bash`, plus `zstd` if you want to read session transcripts
 
-Verify everything at once with `/dsh:check` after installing.
+Verify everything at once with `/dsh:dsh-check` after installing.
 
 ## Install
 
@@ -51,9 +51,9 @@ only appears in a fresh session.
 
 | Command | What it does |
 | --- | --- |
-| `/dsh:delegate` | hand a task to `dsh` — explore a subsystem, map a codebase, find every occurrence |
-| `/dsh:check` | is the harness ready: binary, profiles, active model, credentials |
-| `/dsh:second-opinion` | check your own hypothesis against `dsh`, which reads the relevant code itself |
+| `/dsh:dsh-delegate` | hand a task to `dsh` — explore a subsystem, map a codebase, find every occurrence |
+| `/dsh:dsh-check` | is the harness ready: binary, profiles, active model, credentials |
+| `/dsh:dsh-second-opinion` | check your own hypothesis against `dsh`, which reads the relevant code itself |
 
 Two internal pieces you never call directly: the `dsh-runtime` skill (the calling contract,
 preloaded into the subagent) and the `dsh:dsh-runner` subagent (a thin forwarder whose only
@@ -63,7 +63,7 @@ your main context).
 ## How it works
 
 ```
-/dsh:delegate  ──Agent──▶  dsh:dsh-runner  ──Bash──▶  scripts/dsh-run.sh  ──▶  dsh --profile headless
+/dsh:dsh-delegate  ──Agent──▶  dsh:dsh-runner  ──Bash──▶  scripts/dsh-run.sh  ──▶  dsh --profile headless
    decides                  forwards only              all the mechanics          the actual agent
 ```
 
@@ -107,7 +107,7 @@ still running · `6` timeout, non-zero exit, or empty answer.
 ## What it looks like
 
 ```
-> /dsh:check
+> /dsh:dsh-check
 готовность:   yes
 бинарь:       /opt/homebrew/bin/dsh (ok)
 версия:       0.1.1-rc.2
@@ -157,7 +157,7 @@ writes, not reads — whoever writes the task owns this.
 ## A note on language
 
 The skill bodies, the script's comments **and all of its runtime output** are written in
-Russian — `/dsh:check` and every error message will greet you in Russian, as the sample
+Russian — `/dsh:dsh-check` and every error message will greet you in Russian, as the sample
 above shows. This README, the manifests, and every command, flag, and identifier are in
 English. The skills work the same regardless of the language you talk to Claude in.
 
