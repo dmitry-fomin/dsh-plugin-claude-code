@@ -54,6 +54,7 @@ only appears in a fresh session.
 | `/dsh:dsh-delegate` | hand a task to `dsh` — explore a subsystem, map a codebase, find every occurrence |
 | `/dsh:dsh-check` | is the harness ready: binary, profiles, active model, credentials |
 | `/dsh:dsh-second-opinion` | check your own hypothesis against `dsh`, which reads the relevant code itself |
+| `/dsh:dsh-jobs` | what `dsh` is running right now: status, progress, collect an answer, cancel a job |
 
 Two internal pieces you never call directly: the `dsh-runtime` skill (the calling contract,
 preloaded into the subagent) and the `dsh:dsh-runner` subagent (a thin forwarder whose only
@@ -62,10 +63,21 @@ your main context).
 
 ## How it works
 
+A delegated task runs **in the background** and gets an id of its own. Claude launches it,
+keeps working on your request, and polls the job the way it would poll any other agent:
+
 ```
-/dsh:dsh-delegate  ──Agent──▶  dsh:dsh-runner  ──Bash──▶  scripts/dsh-run.sh  ──▶  dsh --profile headless
-   decides                  forwards only              all the mechanics          the actual agent
+/dsh:dsh-delegate  ──Bash──▶  dsh-run.sh run --background  ──▶  job id
+       │                                                          │
+       │  keeps working on your task                    detached worker: dsh --profile headless
+       │                                                          │
+       └── status / logs / cancel / result <job-id>  ◀────────────┘
 ```
+
+The job outlives the tool call that started it, so a run that takes forty minutes is no
+longer a problem: the Bash tool's ten-minute ceiling applies to the launch, not to `dsh`.
+The `dsh:dsh-runner` subagent is still there for the synchronous route and for collecting a
+large answer without flooding the main context.
 
 The invariant everything rests on: **stdout of `dsh-run.sh run` is exactly the model's final
 answer, nothing else.** Diagnostics go to stderr. That is what makes "show the output
@@ -83,10 +95,13 @@ EOF
 
 | Subcommand | Purpose |
 | --- | --- |
-| `run` | one shot; prompt on stdin, answer on stdout |
-| `check [--json]` | readiness report; exit 1 when not ready |
-| `status [job-id]` | background jobs |
-| `result <job-id>` | collect a finished background job |
+| `run` | one shot; prompt on stdin. With `--background`, stdout is a job id instead of the answer |
+| `check [--json]` | readiness report plus how many jobs are running; exit 1 when not ready |
+| `status [--json] [--all] [--running] [job-id]` | jobs from this directory, or one job's card |
+| `result <job-id> [--wait [sec]]` | collect a finished job; `--wait` polls for you |
+| `logs <job-id> [--tail N]` | a running job's progress: the harness's stderr, bytes of answer so far |
+| `cancel <job-id\|--all>` | kill a job and its whole process tree |
+| `clean [--older-than <days>] [--all]` | drop finished jobs; running ones are left alone |
 | `transcript [job-id]` | full JSONL session — what the harness actually did |
 
 | Option | Default | Meaning |
@@ -95,14 +110,20 @@ EOF
 | `--model pro\|flash\|vision\|<name>` | user's setting | `pro` for hard reasoning, `flash` for mechanical work |
 | `--effort low\|medium\|high\|xhigh\|max` | user's setting | only together with `--model` |
 | `--cwd <dir>` | current directory | working directory and sandbox boundary |
-| `--timeout <sec>` | 600 | matches the Bash tool's own ceiling |
+| `--timeout <sec>` | 540 foreground, 7200 background | `0` removes the limit entirely |
 | `--background` | off | detach, print a job id |
+| `--label <text>` | none | short note so the job is recognisable in `status` |
 
 Always use a **quoted** heredoc (`<<'EOF'`). Tasks nearly always contain code, and an
 unquoted marker lets the shell expand `$` and backticks before the text ever reaches `dsh`.
 
 Exit codes: `0` success · `1` `check` not ready / no jobs · `2` bad invocation · `5` job
-still running · `6` timeout, non-zero exit, or empty answer.
+still running · `6` timeout, cancelled, non-zero exit, or empty answer.
+
+Job states: `running` · `completed` · `timeout` · `canceled` · `failed` · `orphaned` (the
+worker died with the machine or a `kill -9`). A job card prints the state twice —
+`status=` is what the worker recorded, `actual_status=` corrects it against whether the
+process is actually alive. Trust the second one.
 
 ## What it looks like
 
@@ -113,9 +134,20 @@ still running · `6` timeout, non-zero exit, or empty answer.
 версия:       0.1.1-rc.2
 профили:      headless,web
 модель:       deepseek-official / deepseek-v4-pro (effort: max)
+фоновых задач в работе: 0
 ```
 
-A delegated task comes back as one final message — the harness's own words, passed through
+Delegating looks like this — the launch returns immediately, the answer is collected later:
+
+```
+> /dsh:dsh-delegate map the auth subsystem
+задача ушла в dsh: dsh-20260826-133830-17492 (карта подсистемы auth)
+
+> что там дипсик
+dsh-20260826-133830-17492    running    6м12с   deepseek-v4-pro   карта подсистемы auth
+```
+
+A collected task comes back as one final message — the harness's own words, passed through
 verbatim. Asked to review this very script, it answered with a numbered list of defects,
 each with a line number and the scenario that triggers it; nine of them were real and got
 fixed before this release.
@@ -127,6 +159,7 @@ fixed before this release.
 | `DSH_BIN` | `dsh` from `PATH` | full path to the harness binary when it isn't on `PATH` |
 | `DSH_HOME` | `~/.dsh` | harness home: settings, credentials, session transcripts |
 | `DSH_CLAUDE_STATE_DIR` | `${XDG_STATE_HOME:-~/.local/state}/dsh-claude` | where background jobs are kept |
+| `DSH_CLAUDE_SESSION` | `CLAUDE_SESSION_ID` | tags jobs so `status` scopes by session instead of by directory |
 
 ## Two things worth knowing
 
@@ -146,11 +179,16 @@ writes, not reads — whoever writes the task owns this.
   new task instead of continuing a conversation.
 - The task travels as a single argv element; prompts above 256 KiB are rejected. Put bulk
   material in a file inside the working directory and point at it.
-- No `cancel` for background jobs, and `status` is not scoped per Claude Code session — it
-  lists all your jobs.
-- Background jobs are kept forever: each one leaves its prompt, answer, and stderr as plain
-  files under `DSH_CLAUDE_STATE_DIR` (mode 700, but never pruned). Clean the directory
-  yourself if the prompts are sensitive.
+- Background jobs leave their prompt, answer, and stderr as plain files under
+  `DSH_CLAUDE_STATE_DIR` (mode 700). They are never pruned on their own — run `clean` if the
+  prompts are sensitive.
+- `status` and `cancel --all` scope to jobs started from the current working directory or a
+  subdirectory of it; `status --all` shows every job on the machine. Set `DSH_CLAUDE_SESSION`
+  to scope by session instead — Claude Code doesn't put `CLAUDE_SESSION_ID` in the Bash
+  tool's environment, so the directory is the reliable boundary.
+- `cancel` sends `TERM` to the process tree and escalates to `KILL` after ten seconds. Work
+  `dsh` already wrote to disk in `--write` mode stays written — cancelling stops the agent,
+  it doesn't roll anything back.
 - In headless mode there is no approval channel, so a request to escalate permissions is
   declined rather than queued. Re-run with `--write` if the task genuinely needs it.
 
