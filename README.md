@@ -13,20 +13,58 @@ is phrased.
 
 ## Where your code goes
 
-`dsh` sends the files it reads to DeepSeek's servers (provider `deepseek-official`). This
-plugin is a bridge, not a sandbox: installing it means your working directory can leave your
+`dsh` sends the files it reads to whichever provider it is configured for — DeepSeek's own
+API by default, or any other route you set up (see *Providers and keys* below). This plugin
+is a bridge, not a sandbox: installing it means your working directory can leave your
 machine. Read-only mode prevents writes, not reads. Decide whether that is acceptable for a
 given repository *before* you delegate, and scope every task to the files it actually needs.
+
+## Providers and keys
+
+The harness is not tied to a DeepSeek account. Two adapters ship in its base bundle and both
+read `~/.dsh/settings.yaml`, hot-reloaded:
+
+- `llm-deepseek` owns the native route `deepseek-official`. Its key is a *reference*:
+  ```yaml
+  llm-deepseek:
+    apiKeyEnv: DEEPSEEK_HARNESS_API_KEY   # default: DEEPSEEK_API_KEY
+  ```
+- `llm-pi-ai` is a multi-provider adapter, mounted dormant until an `llm-pi-ai:` section
+  gives it routes. Catalog routes (`anthropic`, `openai`, `openrouter`, `zai`, `google`, …)
+  need nothing but a key reference; a private gateway is declared outright with `api`,
+  `baseURL`, and a `models` list.
+  ```yaml
+  llm-pi-ai:
+    providers:
+      openrouter:
+        apiKeyEnv: OPENROUTER_API_KEY
+  agent-default-model:
+    provider: openrouter
+    model: deepseek/deepseek-v4-pro
+    reasoningEffort: xhigh
+  ```
+
+No secret is stored in that file: `apiKeyEnv` names an environment variable resolved per
+request. The variable has to be exported in the environment Claude Code itself was launched
+from — an `export` added to your shell profile after the session started is not there yet,
+and the run fails with `MISSING_CREDENTIAL` until you restart from a fresh terminal.
+
+`/dsh:dsh-check` prints the active provider and the routes the `llm-pi-ai:` section raised.
+Per-run overrides are `--provider <route>` and `--model <id>`; the `pro|flash|vision`
+aliases expand to the DeepSeek catalog and are therefore refused on any other route unless
+you define `DSH_MODEL_PRO`, `DSH_MODEL_FLASH`, or `DSH_MODEL_VISION`.
 
 ## Requirements
 
 - [Claude Code](https://code.claude.com) v2.1.216 or later — earlier versions drop the
   plugin prefix from command names, so `/dsh:dsh-delegate` would not resolve
-- DeepSeek Harness on your `PATH`, signed in, with the `headless` profile available:
+- DeepSeek Harness on your `PATH`, authenticated, with the `headless` profile available:
   ```
   npm install -g @deepseek-ai/dsh
-  dsh --profile web        # sign in through the web UI once
+  dsh --profile web        # sign in through the web UI once — or configure an API key
   ```
+  Signing in is one way to authenticate; an API key reference in `~/.dsh/settings.yaml`
+  is the other, and it is what lets the harness run on a provider of your choosing.
   Note the name collision: Homebrew's `dsh` is an unrelated tool (Dancer's shell). The one
   this plugin drives is the npm package `@deepseek-ai/dsh`, which is pre-release software —
   its flags may still move.
@@ -160,13 +198,17 @@ fixed before this release.
 | `DSH_HOME` | `~/.dsh` | harness home: settings, credentials, session transcripts |
 | `DSH_CLAUDE_STATE_DIR` | `${XDG_STATE_HOME:-~/.local/state}/dsh-claude` | where background jobs are kept |
 | `DSH_CLAUDE_SESSION` | `CLAUDE_SESSION_ID` | tags jobs so `status` scopes by session instead of by directory |
+| `DSH_MODEL_PRO` / `DSH_MODEL_FLASH` / `DSH_MODEL_VISION` | DeepSeek catalog ids | what the `pro`/`flash`/`vision` aliases expand to; required for those aliases on a non-DeepSeek route |
 
 ## Two things worth knowing
 
 **Choosing the model is not what you'd expect.** `dsh --patch` does *not* override the
 model: the user layer in `~/.dsh/settings.yaml` is applied on top of any overlay. The script
-works around this by repointing the settings plugin at a generated document. Use `--model`
-and let it handle that.
+works around this by repointing the settings plugin at a generated document. Because that
+repoints the whole document, the generated one is a *copy* of your settings with only
+`agent-default-model:` rewritten — the `llm-deepseek:` and `llm-pi-ai:` sections have to
+survive, or a run with `--model` would silently fall back to the default key and the native
+route. Use `--model` / `--provider` and let the script handle it.
 
 **The secret guard cannot live in the prompt.** `dsh` opens files by itself, so scanning the
 task text proves nothing. Scope every task to the files it actually needs and say plainly

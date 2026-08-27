@@ -115,8 +115,9 @@ usage() {
   cat >&2 <<'USAGE'
 usage:
   dsh-run.sh check [--json]
-  dsh-run.sh run [--write] [--model pro|flash|vision|<имя>] [--effort <level>]
-                 [--cwd <dir>] [--timeout <сек>] [--background] [--label <текст>]
+  dsh-run.sh run [--write] [--model pro|flash|vision|<id>] [--effort <level>]
+                 [--provider <маршрут>] [--cwd <dir>] [--timeout <сек>]
+                 [--background] [--label <текст>]
                  < prompt.txt
   dsh-run.sh status [--json] [--all] [--running] [job-id]
   dsh-run.sh result <job-id> [--wait [сек]]
@@ -151,6 +152,40 @@ pick_timeout_bin() {
   else echo ""; fi
 }
 
+# --- чтение user-слоя настроек ----------------------------------------------
+# Значение подключа верхнеуровневой секции `agent-default-model:`. Границей
+# секции служит первая строка, начатая не с пробела: полноценного YAML-парсера
+# в зависимостях нет, а секция по формату всегда плоская.
+settings_field() {
+  local key="$1" settings="$DSH_HOME_DIR/settings.yaml"
+  [[ -f "$settings" ]] || return 0
+  awk -v key="$key" '
+    /^agent-default-model:/ { f=1; next }
+    f && /^[^ ]/ { f=0 }
+    f && $1 == key ":" { sub(/^[[:space:]]*[^:]+:[[:space:]]*/, ""); print; exit }
+  ' "$settings"
+}
+
+# Имена маршрутов из секции `llm-pi-ai: providers:` — то, какие провайдеры
+# вообще подняты. Нужны для диагностики: provider из agent-default-model,
+# которого нет ни здесь, ни среди нативных, — это UNKNOWN_MODEL на прогоне.
+settings_providers() {
+  local settings="$DSH_HOME_DIR/settings.yaml"
+  [[ -f "$settings" ]] || return 0
+  awk '
+    /^llm-pi-ai:/ { top=1; next }
+    top && /^[^ ]/ { top=0 }
+    top && /^[[:space:]]+providers:/ { inp=1; indent=match($0, /[^ ]/); next }
+    inp && /^[[:space:]]*#/ { next }
+    inp && /^[[:space:]]*$/ { next }
+    inp {
+      col = match($0, /[^ ]/)
+      if (col <= indent) { inp=0; next }
+      if (col == indent + 2 && $1 ~ /:$/) { name=$1; sub(/:$/, "", name); print name }
+    }
+  ' "$settings" | paste -sd, - || true
+}
+
 # --- check ------------------------------------------------------------------
 cmd_check() {
   local as_json=0
@@ -179,12 +214,15 @@ cmd_check() {
 
   # Модель читаем из user-слоя настроек: именно он перекрывает всё остальное,
   # включая --patch overlay (проверено вживую — см. SKILL.md).
-  local settings="$DSH_HOME_DIR/settings.yaml"
-  if [[ -f "$settings" ]]; then
-    model="$(awk '/^agent-default-model:/{f=1;next} f&&/^[^ ]/{f=0} f&&/^[[:space:]]*model:/{gsub(/^[[:space:]]*model:[[:space:]]*/,"");print;exit}' "$settings")"
-    provider="$(awk '/^agent-default-model:/{f=1;next} f&&/^[^ ]/{f=0} f&&/^[[:space:]]*provider:/{gsub(/^[[:space:]]*provider:[[:space:]]*/,"");print;exit}' "$settings")"
-    effort="$(awk '/^agent-default-model:/{f=1;next} f&&/^[^ ]/{f=0} f&&/^[[:space:]]*reasoningEffort:/{gsub(/^[[:space:]]*reasoningEffort:[[:space:]]*/,"");print;exit}' "$settings")"
-  fi
+  model="$(settings_field model)"
+  provider="$(settings_field provider)"
+  effort="$(settings_field reasoningEffort)"
+
+  # Маршруты мульти-провайдерного адаптера: они поднимаются только из секции
+  # `llm-pi-ai:`, поэтому пустой список при provider не из этой секции — норма,
+  # а при нём — ровно та поломка, которую надо увидеть.
+  local routes=""
+  routes="$(settings_providers)"
 
   # Признак выполненного входа: локальное хранилище учётных данных харнесса.
   # Содержимое не читаем и наружу не отдаём — только факт существования.
@@ -206,10 +244,11 @@ cmd_check() {
   [[ "$bin_status" == "ok" && "$profiles" == *headless* ]] && ready="yes"
 
   if [[ $as_json -eq 1 ]]; then
-    printf '{"ready":"%s","binary":"%s","binary_status":"%s","version":"%s","profiles":"%s","provider":"%s","model":"%s","effort":"%s","credentials":"%s","dsh_home":"%s","running_jobs":%s}\n' \
+    printf '{"ready":"%s","binary":"%s","binary_status":"%s","version":"%s","profiles":"%s","provider":"%s","model":"%s","effort":"%s","credentials":"%s","pi_ai_routes":"%s","dsh_home":"%s","running_jobs":%s}\n' \
       "$(json_escape "$ready")" "$(json_escape "$bin")" "$(json_escape "$bin_status")" \
       "$(json_escape "$version")" "$(json_escape "$profiles")" "$(json_escape "$provider")" \
       "$(json_escape "$model")" "$(json_escape "$effort")" "$(json_escape "$auth")" \
+      "$(json_escape "$routes")" \
       "$(json_escape "$DSH_HOME_DIR")" "$running"
   else
     echo "готовность:   $ready"
@@ -217,7 +256,8 @@ cmd_check() {
     echo "версия:       ${version:-—}"
     echo "профили:      ${profiles:-—}"
     echo "модель:       ${provider:-—} / ${model:-—} (effort: ${effort:-—})"
-    echo "учётные данные: $auth"
+    echo "маршруты pi-ai: ${routes:-—}"
+    echo "учётные данные: $auth"   # вход в веб-интерфейс; на API-ключе бывает absent — это не поломка
     echo "фоновых задач в работе: $running"
     echo "DSH_HOME:     $DSH_HOME_DIR"
   fi
@@ -239,15 +279,37 @@ count_running_jobs() {
 # `--patch` НЕ переопределяет модель: user-слой settings.yaml накладывается
 # поверх любого overlay. Рабочий обход — подменить сам путь, из которого
 # settings-плагин читает документ (проверено: так поднимается deepseek-v4-pro).
-write_model_overlay() {
-  local model="$1" effort="$2" dir="$3"
+#
+# Подменяется ПУТЬ, а не одна секция, поэтому overlay обязан нести весь
+# пользовательский документ. Файл из одного `agent-default-model:` выкидывал бы
+# заодно `llm-deepseek:` и `llm-pi-ai:` — ссылку на ключ и профили провайдеров —
+# и прогон молча уезжал на дефолтный ключ (DEEPSEEK_API_KEY) и нативный
+# маршрут, независимо от того, что человек настроил. Поэтому копируем документ
+# целиком и переписываем в нём ровно одну секцию.
+write_settings_overlay() {
+  local model="$1" effort="$2" provider="$3" dir="$4"
+  local user_settings="$DSH_HOME_DIR/settings.yaml"
   local settings_file="$dir/settings.yaml" patch_file="$dir/patch.yml"
+
+  if [[ -f "$user_settings" ]]; then
+    # Вырезаем прежнюю секцию целиком: она верхнеуровневая и кончается на
+    # первой строке, начатой не с пробела.
+    awk '
+      /^agent-default-model:/ { f=1; next }
+      f && /^[[:space:]]*$/ { next }
+      f && /^[^ ]/ { f=0 }
+      !f { print }
+    ' "$user_settings" > "$settings_file"
+  else
+    : > "$settings_file"
+  fi
+
   {
     echo "agent-default-model:"
-    echo "  provider: deepseek-official"
+    echo "  provider: $provider"
     echo "  model: $model"
     [[ -n "$effort" ]] && echo "  reasoningEffort: $effort"
-  } > "$settings_file"
+  } >> "$settings_file"
   {
     echo "- id: settings"
     echo "  config:"
@@ -256,22 +318,40 @@ write_model_overlay() {
   echo "$patch_file"
 }
 
+# Алиасы моделей провайдер-зависимы: pro/flash/vision — это каталог DeepSeek.
+# На чужом маршруте (openrouter, zai, свой шлюз) таких id нет, и молчаливая
+# подстановка deepseek-v4-pro стоила бы прогона: в лучшем случае UNKNOWN_MODEL,
+# в худшем — тихий уход на другого провайдера. Поэтому либо переопределение
+# через DSH_MODEL_PRO / DSH_MODEL_FLASH / DSH_MODEL_VISION, либо полный id.
 expand_model_alias() {
-  case "$1" in
-    pro)    echo "deepseek-v4-pro" ;;
-    flash)  echo "deepseek-v4-flash" ;;
-    vision) echo "deepseek-v4-flash-vision-exp" ;;
-    *)      echo "$1" ;;
+  local alias="$1" provider="$2" override=""
+  case "$alias" in
+    pro)    override="${DSH_MODEL_PRO:-}" ;;
+    flash)  override="${DSH_MODEL_FLASH:-}" ;;
+    vision) override="${DSH_MODEL_VISION:-}" ;;
+    *)      printf '%s' "$alias"; return 0 ;;
+  esac
+  if [[ -n "$override" ]]; then printf '%s' "$override"; return 0; fi
+  case "$provider" in
+    deepseek-official|"")
+      case "$alias" in
+        pro)    printf '%s' "deepseek-v4-pro" ;;
+        flash)  printf '%s' "deepseek-v4-flash" ;;
+        vision) printf '%s' "deepseek-v4-flash-vision-exp" ;;
+      esac ;;
+    *)
+      die 2 "алиас '$alias' определён только для провайдера deepseek-official, а текущий — '$provider'. Назови модель полным id (--model <id>) или задай переменную DSH_MODEL_$(printf '%s' "$alias" | tr '[:lower:]' '[:upper:]')" ;;
   esac
 }
 
 # --- run --------------------------------------------------------------------
 cmd_run() {
-  local write=0 model="" effort="" workdir="" timeout_s="" background=0 label=""
+  local write=0 model="" effort="" workdir="" timeout_s="" background=0 label="" provider_opt=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --write)      write=1; shift ;;
       --model)      model="$(need_value --model "${2:-}")"; shift 2 ;;
+      --provider)   provider_opt="$(need_value --provider "${2:-}")"; shift 2 ;;
       --effort)     effort="${2:-}"; [[ -z "$effort" ]] && die 2 "--effort требует значение"
                     case "$effort" in low|medium|high|xhigh|max) ;; *) die 2 "--effort принимает low, medium, high, xhigh или max" ;; esac
                     shift 2 ;;
@@ -315,22 +395,36 @@ cmd_run() {
 
   local tmpdir=""
   local args=(--profile headless)
-  if [[ -n "$model" ]]; then
+  local provider="" eff_model=""
+  if [[ -n "$model" || -n "$effort" || -n "$provider_opt" ]]; then
+    # Провайдер: явный флаг → выбор человека в settings.yaml → нативный
+    # маршрут DeepSeek последним дефолтом. Своего мнения о провайдере у
+    # обвязки нет: она правит секцию, а не решает, куда ходить.
+    provider="${provider_opt:-$(settings_field provider)}"
+    provider="${provider:-deepseek-official}"
+
+    if [[ -n "$model" ]]; then
+      eff_model="$(expand_model_alias "$model" "$provider")" || exit $?
+    else
+      # Только --effort или только --provider: модель остаётся выбранной
+      # человеком, её нужно перенести в overlay как есть.
+      eff_model="$(settings_field model)"
+      [[ -n "$eff_model" ]] || die 2 "модель не выбрана ни флагом, ни в settings.yaml — добавь --model <id>"
+    fi
+
     tmpdir="$(mktemp -d "${TMPDIR:-/tmp}/dsh-overlay.XXXXXX")"
     chmod 700 "$tmpdir"
     CLEANUP_PATHS+=("$tmpdir")
     local patch_file
-    patch_file="$(write_model_overlay "$(expand_model_alias "$model")" "$effort" "$tmpdir")"
+    patch_file="$(write_settings_overlay "$eff_model" "$effort" "$provider" "$tmpdir")"
     args+=(--patch "$patch_file")
-  elif [[ -n "$effort" ]]; then
-    die 2 "--effort задаётся только вместе с --model (уровень усилий живёт в той же секции настроек)"
   fi
 
   if [[ $background -eq 1 ]]; then
     # Overlay переживает выход этого процесса: его убирает сам воркер.
     [[ -n "$tmpdir" ]] && CLEANUP_PATHS=()
     run_background "$bin" "$mode" "$workdir" "$timeout_s" "$prompt" "$tmpdir" \
-      "$(expand_model_alias "${model:-}")" "$effort" "$label" "${args[@]}"
+      "$eff_model" "$effort" "$provider" "$label" "${args[@]}"
     return 0
   fi
 
@@ -392,7 +486,8 @@ claim_job_dir() {
 
 run_background() {
   local bin="$1" mode="$2" workdir="$3" timeout_s="$4" prompt="$5" tmpdir="$6"
-  local model="$7" effort="$8" label="$9"; shift 9
+  local model="$7" effort="$8" provider="$9"; shift 9
+  local label="$1"; shift
   local args=("$@")
   local job_id job_dir
   job_id="$(claim_job_dir)"
@@ -409,6 +504,7 @@ run_background() {
     echo "cwd=$workdir"
     echo "mode=$mode"
     echo "model=${model:-—}"
+    echo "provider=${provider:-—}"
     echo "effort=${effort:-—}"
     echo "label=${label:-—}"
     echo "session=${SESSION_ID:-—}"
@@ -623,7 +719,7 @@ cmd_status() {
 
 job_json() {
   local dir="$1" st="$2"
-  printf '{"id":"%s","status":"%s","meta_status":"%s","label":"%s","cwd":"%s","mode":"%s","model":"%s","effort":"%s","session":"%s","started":"%s","elapsed":"%s","timeout":"%s","exit":"%s","output_bytes":%s}' \
+  printf '{"id":"%s","status":"%s","meta_status":"%s","label":"%s","cwd":"%s","mode":"%s","model":"%s","provider":"%s","effort":"%s","session":"%s","started":"%s","elapsed":"%s","timeout":"%s","exit":"%s","output_bytes":%s}' \
     "$(json_escape "$(meta_get id "$dir/meta")")" \
     "$(json_escape "$st")" \
     "$(json_escape "$(meta_get status "$dir/meta")")" \
@@ -631,6 +727,7 @@ job_json() {
     "$(json_escape "$(meta_get cwd "$dir/meta")")" \
     "$(json_escape "$(meta_get mode "$dir/meta")")" \
     "$(json_escape "$(meta_get model "$dir/meta")")" \
+    "$(json_escape "$(meta_get provider "$dir/meta")")" \
     "$(json_escape "$(meta_get effort "$dir/meta")")" \
     "$(json_escape "$(meta_get session "$dir/meta")")" \
     "$(json_escape "$(meta_get started "$dir/meta")")" \
