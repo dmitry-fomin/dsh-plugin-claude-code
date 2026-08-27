@@ -371,10 +371,23 @@ run_foreground() {
   printf '%s\n' "$out"
 }
 
-new_job_id() {
-  # Ни date, ни $RANDOM по отдельности не дают достаточной уникальности
-  # при двух запусках в одну секунду; вместе — достаточно.
-  printf 'dsh-%s-%s' "$(date +%Y%m%d-%H%M%S)" "$$"
+# Идентификатор задачи — он же имя её каталога, поэтому он же и замок: имя
+# захватывается атомарным mkdir, занятое просто отбрасывается и берётся
+# следующее. Одних date и $$ мало — они совпадают у двух фоновых запусков из
+# одного процесса-скрипта в одну секунду, и вторая задача затёрла бы первой
+# prompt, output и meta. Захват снимает вопрос о достаточности энтропии
+# вообще: уникальность обеспечивает файловая система, а не удачный суффикс.
+claim_job_dir() {
+  local stamp id dir i=0
+  stamp="$(date +%Y%m%d-%H%M%S)"
+  mkdir -p "$JOBS_DIR"
+  while :; do
+    id="dsh-$stamp-$$-$RANDOM"
+    dir="$JOBS_DIR/$id"
+    mkdir "$dir" 2>/dev/null && { printf '%s' "$id"; return 0; }
+    i=$((i+1))
+    [[ $i -ge 100 ]] && die 5 "не удалось выделить идентификатор задачи в $JOBS_DIR"
+  done
 }
 
 run_background() {
@@ -382,9 +395,8 @@ run_background() {
   local model="$7" effort="$8" label="$9"; shift 9
   local args=("$@")
   local job_id job_dir
-  job_id="$(new_job_id)"
+  job_id="$(claim_job_dir)"
   job_dir="$JOBS_DIR/$job_id"
-  mkdir -p "$job_dir"
   chmod 700 "$STATE_DIR" "$JOBS_DIR" 2>/dev/null || true
   chmod 700 "$job_dir"
 
@@ -582,7 +594,9 @@ cmd_status() {
     if [[ $as_json -eq 1 ]]; then
       out+="$(job_json "$d" "$st"),"
     else
-      printf '%-28s %-10s %-8s %-14s %s\n' \
+      # 34 — ширина идентификатора со случайным суффиксом; уже него колонки
+      # разъезжаются, как только в списке окажется задача нового формата.
+      printf '%-34s %-10s %-8s %-14s %s\n' \
         "$dir" "$st" "$(elapsed_of "$d")" \
         "$(meta_get model "$d/meta")" \
         "$(meta_get label "$d/meta")" || exit 0
